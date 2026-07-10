@@ -47,7 +47,16 @@ _CANDIDATE_PATHS = [
 DATASET_PATH = next((p for p in _CANDIDATE_PATHS if p.exists()), _CANDIDATE_PATHS[0])
 
 # ─── CONFIGURATION (shared by all three models) ───────────────────────────────
-TARGET_MODE: str   = 'return'   # 'price' | 'return' | 'log_return'
+# TARGET_MODE — what the models actually predict:
+#   'price'      → the Close price directly
+#   'return'     → daily simple return r_t = (P_t - P_{t-1}) / P_{t-1}
+#   'log_return' → daily log return   r_t = ln(P_t / P_{t-1})
+# For 'return'/'log_return' the price is reconstructed from the PREVIOUS actual
+# close (P_t ≈ P_{t-1}·(1+r̂)). Because daily returns are tiny, the reconstructed
+# price is dominated by P_{t-1} — this is WHY every model visually "tracks"
+# yesterday's price. The honest skill lives in the return space (see the
+# returns-comparison plot and directional accuracy), not the price plot.
+TARGET_MODE: str   = 'log_return'   # 'price' | 'return' | 'log_return'
 WINDOW_SIZE: int   = 30         # lookback for LSTM sequences and MA baseline
 SPLIT_RATIO: float = 0.80       # fraction of data for train + validation
 VAL_RATIO:   float = 0.10       # validation fraction within the train+val block
@@ -317,6 +326,15 @@ def moving_average_baseline(
     ], dtype='float32')
 
 
+def persistence_baseline(close_values: np.ndarray, split_idx: int) -> np.ndarray:
+    """Naive random-walk forecast: tomorrow's price = today's actual close.
+
+    This is the reference every serious model must beat. If LSTM/ARIMA lie on
+    top of this line, they add no information beyond "yesterday's price".
+    """
+    return close_values[split_idx - 1 : len(close_values) - 1].copy()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 6 — PLOTTING
 # ══════════════════════════════════════════════════════════════════════════════
@@ -324,29 +342,149 @@ def moving_average_baseline(
 def plot_model_comparison(
     dates:       pd.Series,
     actual:      np.ndarray,
-    lstm_preds:  np.ndarray,
-    arima_preds: np.ndarray,
-    ma_preds:    np.ndarray,
-    arima_order: tuple,
+    preds:       dict,
 ) -> None:
-    """All three model forecasts + actual on a single chart."""
+    """All model forecasts + actual on a single price chart."""
     x = dates if dates is not None else np.arange(len(actual))
-
+    styles = {
+        'LSTM':        ('steelblue', '--', 1.6),
+        'Persistence': ('purple',    '-',  1.0),
+    }
     plt.figure(figsize=(16, 7))
-    plt.plot(x, actual,      label='Actual',            color='black',      linewidth=2.2)
-    plt.plot(x, lstm_preds,  label='LSTM',              color='steelblue',  linewidth=1.6, linestyle='--')
-    plt.plot(x, arima_preds, label=f'ARIMA{arima_order}', color='crimson',  linewidth=1.6, linestyle='-.')
-    plt.plot(x, ma_preds,    label=f'Moving Average ({WINDOW_SIZE})', color='green', linewidth=1.6, linestyle=':')
+    plt.plot(x, actual, label='Actual', color='black', linewidth=2.2)
+    palette = ['crimson', 'green', 'darkorange', 'brown', 'teal']
+    ci = 0
+    for name, series in preds.items():
+        color, ls, lw = styles.get(name, (palette[ci % len(palette)], '-.', 1.6))
+        if name not in styles:
+            ci += 1
+        plt.plot(x, series, label=name, color=color, linestyle=ls, linewidth=lw)
 
     plt.title(
         'S&P 500 — Next-Day Close Forecast Comparison (Test Period)\n'
-        f'LSTM vs ARIMA vs Moving Average   |   TARGET_MODE={TARGET_MODE}  WINDOW={WINDOW_SIZE}'
+        f'LSTM vs ARIMA vs Moving Average vs Persistence   |   '
+        f'TARGET_MODE={TARGET_MODE}  WINDOW={WINDOW_SIZE}'
     )
     plt.xlabel('Date' if dates is not None else 'Test Day Index')
     plt.ylabel('Price (USD)')
     plt.legend(loc='best')
     plt.tight_layout()
     plt.savefig('model_comparison_predictions.png', dpi=150)
+    plt.show()
+
+
+def plot_returns_comparison(
+    dates:        pd.Series,
+    actual:       np.ndarray,
+    prev_prices:  np.ndarray,
+    preds:        dict,
+) -> None:
+    """Same forecasts, but in RETURN space — this reveals the real skill.
+
+    In price space every model hugs the actual line (because of the P_{t-1}
+    anchor). In return space you can see whether a model actually predicts the
+    daily change, or just outputs noise around zero.
+    """
+    x = dates if dates is not None else np.arange(len(actual))
+    actual_ret = actual / prev_prices - 1.0
+
+    # Only the learned models are meaningful in return space (MA/Persistence
+    # would just clutter the picture). Persistence's predicted return is 0 by
+    # construction; MA's is a large lagged artifact.
+    learned = [n for n in preds if n.startswith(('LSTM', 'ARIMA'))]
+    palette = {'LSTM': 'steelblue'}
+
+    fig, axes = plt.subplots(2, 1, figsize=(16, 9))  # NO shared x — panels differ
+    fig.suptitle(
+        'Daily RETURN space — do the models predict the change, or just noise?\n'
+        f'TARGET_MODE={TARGET_MODE}',
+        fontsize=13,
+    )
+
+    # Top: actual vs learned-model predicted returns over time
+    axes[0].axhline(0.0, color='gray', linewidth=0.8)
+    axes[0].plot(x, actual_ret, label='Actual return', color='black', linewidth=1.2, alpha=0.9)
+    for name in learned:
+        pred_ret = preds[name] / prev_prices - 1.0
+        axes[0].plot(x, pred_ret, label=f'{name} pred.',
+                     color=palette.get(name, 'crimson'), linewidth=1.0, alpha=0.85)
+    ylim = float(np.max(np.abs(actual_ret))) * 1.1
+    axes[0].set_ylim(-ylim, ylim)
+    axes[0].set_ylabel('Daily return')
+    axes[0].set_xlabel('Date' if dates is not None else 'Test Day Index')
+    axes[0].set_title(
+        'Predicted vs actual daily returns — model predictions stay near 0 '
+        'while the market swings widely'
+    )
+    axes[0].legend(loc='upper right', fontsize=8, ncol=len(learned) + 1)
+
+    # Bottom: scatter of predicted vs actual return for the learned models
+    for name in learned:
+        pred_ret = preds[name] / prev_prices - 1.0
+        axes[1].scatter(actual_ret, pred_ret, s=8, alpha=0.35, label=name,
+                        color=palette.get(name, 'crimson'))
+    lim = float(np.max(np.abs(actual_ret))) * 1.05
+    axes[1].plot([-lim, lim], [-lim, lim], 'r--', linewidth=1.0, label='Perfect prediction')
+    axes[1].axhline(0.0, color='gray', linewidth=0.6)
+    axes[1].axvline(0.0, color='gray', linewidth=0.6)
+    axes[1].set_xlim(-lim, lim)
+    axes[1].set_ylim(-lim, lim)
+    axes[1].set_xlabel('Actual daily return')
+    axes[1].set_ylabel('Predicted daily return')
+    axes[1].set_title(
+        'If models had skill, points would follow the red diagonal — '
+        'instead they form a flat cloud near 0'
+    )
+    axes[1].legend(loc='upper left', fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig('model_comparison_returns.png', dpi=150)
+    plt.show()
+
+
+def plot_crash_zoom(
+    dates:        pd.Series,
+    actual:       np.ndarray,
+    prev_prices:  np.ndarray,
+    preds:        dict,
+    window:       int = 40,
+) -> None:
+    """Zoom on the sharpest single-day drop to show the one-day LAG effect.
+
+    Models cannot foresee a crash: on the crash day they miss it (anchored on
+    the pre-crash price) and only 'catch up' the next day. This is reaction with
+    a lag, not genuine prediction.
+    """
+    actual_ret = actual / prev_prices - 1.0
+    crash_i = int(np.argmin(actual_ret))
+    lo = max(0, crash_i - window // 2)
+    hi = min(len(actual), crash_i + window // 2)
+    x = (dates.iloc[lo:hi] if dates is not None else np.arange(lo, hi))
+
+    plt.figure(figsize=(14, 6))
+    plt.plot(x, actual[lo:hi], label='Actual', color='black', linewidth=2.4, marker='o', markersize=3)
+    styles = {'LSTM': ('steelblue', '--'), 'Persistence': ('purple', '-')}
+    palette = ['crimson', 'green', 'darkorange']
+    ci = 0
+    for name, series in preds.items():
+        color, ls = styles.get(name, (palette[ci % len(palette)], '-.'))
+        if name not in styles:
+            ci += 1
+        plt.plot(x, series[lo:hi], label=name, color=color, linestyle=ls, linewidth=1.5)
+
+    drop_pct = actual_ret[crash_i] * 100.0
+    crash_date = dates.iloc[crash_i].date() if dates is not None else f'idx {crash_i}'
+    plt.axvline(x.iloc[crash_i - lo] if dates is not None else crash_i,
+                color='red', linewidth=1.0, linestyle=':')
+    plt.title(
+        f'Zoom on sharpest drop ({crash_date}, {drop_pct:.2f}% in one day)\n'
+        'Models miss the crash on the day and only react afterwards (one-day lag)'
+    )
+    plt.xlabel('Date' if dates is not None else 'Test Day Index')
+    plt.ylabel('Price (USD)')
+    plt.legend(loc='best')
+    plt.tight_layout()
+    plt.savefig('model_comparison_crash_zoom.png', dpi=150)
     plt.show()
 
 
@@ -469,20 +607,26 @@ def main() -> None:
     ma_preds = moving_average_baseline(close_values, split_idx, WINDOW_SIZE)
     print(f'Rolling mean over last {WINDOW_SIZE} actual closes computed.')
 
+    # ── Reference: naive persistence (random walk) ───────────────────────────
+    persistence_preds = persistence_baseline(close_values, split_idx)
+
     # ── Metrics ──────────────────────────────────────────────────────────────
     lstm_label  = 'LSTM'
     arima_label = f'ARIMA{best_order}'
     ma_label    = f'MA-{WINDOW_SIZE}'
+    pers_label  = 'Persistence'
 
-    metrics = {
-        lstm_label:  compute_metrics(actual_close, lstm_preds),
-        arima_label: compute_metrics(actual_close, arima_preds),
-        ma_label:    compute_metrics(actual_close, ma_preds),
+    # Order matters for plots/tables: learned models, then baselines.
+    preds_all = {
+        lstm_label:  lstm_preds,
+        arima_label: arima_preds,
+        ma_label:    ma_preds,
+        pers_label:  persistence_preds,
     }
+    metrics = {name: compute_metrics(actual_close, p) for name, p in preds_all.items()}
     dir_acc = {
-        lstm_label:  directional_accuracy(actual_close, lstm_preds,  prev_prices_test),
-        arima_label: directional_accuracy(actual_close, arima_preds, prev_prices_test),
-        ma_label:    directional_accuracy(actual_close, ma_preds,    prev_prices_test),
+        name: directional_accuracy(actual_close, p, prev_prices_test)
+        for name, p in preds_all.items()
     }
 
     print(f'\n{"═"*70}')
@@ -490,7 +634,7 @@ def main() -> None:
     print(f'{"═"*70}')
     print(f'  {"Model":<16} {"RMSE":>9} {"MAE":>9} {"MAPE%":>9} {"DirAcc%":>10}')
     print(f'  {"─"*56}')
-    for name in (lstm_label, arima_label, ma_label):
+    for name in preds_all:
         m = metrics[name]
         print(
             f'  {name:<16} {m["RMSE"]:>9.4f} {m["MAE"]:>9.4f} '
@@ -500,28 +644,45 @@ def main() -> None:
     best_by_rmse = min(metrics, key=lambda k: metrics[k]['RMSE'])
     print(f'\n  → Best by RMSE: {best_by_rmse} ({metrics[best_by_rmse]["RMSE"]:.4f})')
 
+    # How close are the learned models to simply repeating yesterday's price?
+    pers_rmse = metrics[pers_label]['RMSE']
+    print(f'\n  Do LSTM / ARIMA beat the naive "tomorrow = today" random walk?')
+    for name in (lstm_label, arima_label):
+        gain = (pers_rmse - metrics[name]['RMSE']) / pers_rmse * 100.0
+        verdict = 'beats it' if gain > 1 else ('≈ same as' if gain > -1 else 'worse than')
+        print(f'    {name:<16} RMSE gain vs persistence: {gain:+6.2f}%  → {verdict} random walk')
+    print('    (A gain near 0% means the model adds no info beyond yesterday\'s price —')
+    print('     the "repetition" your professor noticed. This is the expected EMH result.)')
+
     # ── Save results & plots ─────────────────────────────────────────────────
     results_df = pd.DataFrame([
         {'Model': name, **metrics[name], 'DirAcc%': dir_acc[name]}
-        for name in (lstm_label, arima_label, ma_label)
+        for name in preds_all
     ])
     results_df.to_csv('model_comparison_results.csv', index=False)
     print('\n  Results saved → model_comparison_results.csv')
 
     pd.DataFrame({
-        'Date':    dates_test,
-        'Actual':  actual_close,
-        'LSTM':    lstm_preds,
+        'Date':      dates_test,
+        'Actual':    actual_close,
+        'PrevClose': prev_prices_test,
+        lstm_label:  lstm_preds,
         arima_label: arima_preds,
-        ma_label:  ma_preds,
+        ma_label:    ma_preds,
+        pers_label:  persistence_preds,
     }).to_csv('model_comparison_predictions.csv', index=False)
     print('  Predictions saved → model_comparison_predictions.csv')
 
-    plot_model_comparison(
-        dates_test, actual_close, lstm_preds, arima_preds, ma_preds, best_order,
+    plot_model_comparison(dates_test, actual_close, preds_all)
+    plot_metrics_comparison({k: metrics[k] for k in (lstm_label, arima_label, ma_label)})
+    plot_returns_comparison(dates_test, actual_close, prev_prices_test, preds_all)
+    plot_crash_zoom(dates_test, actual_close, prev_prices_test, preds_all)
+    print(
+        '\n  Plots saved → model_comparison_predictions.png, '
+        'model_comparison_metrics.png,'
+        '\n                model_comparison_returns.png, '
+        'model_comparison_crash_zoom.png'
     )
-    plot_metrics_comparison(metrics)
-    print('\n  Plots saved → model_comparison_predictions.png, model_comparison_metrics.png')
 
 
 if __name__ == '__main__':
